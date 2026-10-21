@@ -482,7 +482,7 @@ app.get('/api/domains', async (req, res) => {
   try {
     const [nsResult, helmResult] = await Promise.all([
       runKubectl(['get', 'namespaces', '-o', 'json']),
-      run('helm', ['list', '-A', '-o', 'json'], { cwd: ROOT }),
+      run('helm', ['list', '-A', '--max', '0', '-o', 'json'], { cwd: ROOT }),
     ]);
     if (nsResult.code !== 0) {
       return res.status(500).json({ success: false, error: 'Namespace listesi alınamadı.' });
@@ -832,7 +832,7 @@ app.post('/api/teardown-all', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Onay için "yes" yazın.' });
   }
 
-  const listResult = await run('helm', ['list', '-A', '-o', 'json'], { cwd: ROOT });
+  const listResult = await run('helm', ['list', '-A', '--max', '0', '-o', 'json'], { cwd: ROOT });
   if (listResult.code !== 0) {
     return res.status(500).json({ success: false, error: 'Helm listesi alınamadı.' });
   }
@@ -1347,6 +1347,31 @@ async function fetchManifestForTag(baseUrl, repoPath, tag, authHeaders) {
   return { digest, app_version, created };
 }
 
+// Yayınlanmış chart tag'leri değişmez; tag başına manifest bilgisini kalıcı tut, yalnızca yeni tag'ler için registry'ye git
+const CHART_TAG_CACHE_FILE = path.join(DATA_DIR, 'chart-tag-cache.json');
+let chartTagCache = null;
+
+function loadChartTagCache() {
+  if (chartTagCache) return chartTagCache;
+  chartTagCache = new Map();
+  try {
+    if (fs.existsSync(CHART_TAG_CACHE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CHART_TAG_CACHE_FILE, 'utf8'));
+      if (data && typeof data === 'object') {
+        for (const [k, v] of Object.entries(data)) chartTagCache.set(k, v);
+      }
+    }
+  } catch (_) {}
+  return chartTagCache;
+}
+
+function saveChartTagCache() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(CHART_TAG_CACHE_FILE, JSON.stringify(Object.fromEntries(chartTagCache)), 'utf8');
+  } catch (_) {}
+}
+
 app.get('/api/v1/chart/versions', async (req, res) => {
   const skipCache = req.query.refresh === 'true' || req.query.refresh === '1';
   if (!skipCache) {
@@ -1368,7 +1393,8 @@ app.get('/api/v1/chart/versions', async (req, res) => {
     const { registry, project, chart_name } = parsed;
     const baseUrl = `https://${registry}`;
     const repoPath = `${project}/${chart_name}`;
-    const tagsUrl = `${baseUrl}/v2/${repoPath}/tags/list`;
+    const TAGS_PAGE_SIZE = 100;
+    const tagsUrl = `${baseUrl}/v2/${repoPath}/tags/list?n=${TAGS_PAGE_SIZE}`;
     let authHeaders = {};
     if (cfg.REGISTRY_USER && cfg.REGISTRY_PASSWORD) {
       authHeaders = {
@@ -1390,21 +1416,47 @@ app.get('/api/v1/chart/versions', async (req, res) => {
     if (response.status !== 200) {
       throw new Error(`Registry ${response.status}: ${(response.body || '').slice(0, 200)}`);
     }
-    const data = response.json();
-    const tags = Array.isArray(data.tags) ? data.tags : [];
-    const tagList = tags.filter((t) => t && typeof t === 'string');
+    // Registry tag listesi sayfalı döner (ghcr.io varsayılan 100); Link rel="next" bittiğinde dur
+    const tagSet = new Set();
+    for (let page = 0; page < 50; page++) {
+      const data = response.json();
+      const before = tagSet.size;
+      for (const t of Array.isArray(data.tags) ? data.tags : []) {
+        if (t && typeof t === 'string') tagSet.add(t);
+      }
+      const nextMatch = /<([^>]+)>\s*;\s*rel="?next"?/i.exec(response.headers.link || '');
+      if (!nextMatch || tagSet.size === before) break;
+      // ghcr.io next linkinde n=0 döndürüyor; sayfa boyutunu açıkça ver
+      const nextUrl = new URL(nextMatch[1], baseUrl);
+      nextUrl.searchParams.set('n', String(TAGS_PAGE_SIZE));
+      response = await httpsGet(nextUrl.toString(), { headers: authHeaders });
+      if (response.status !== 200) {
+        throw new Error(`Registry ${response.status}: ${(response.body || '').slice(0, 200)}`);
+      }
+    }
+    const tagList = [...tagSet];
+    const tagCache = loadChartTagCache();
+    const tagKey = (tag) => `${registry}/${repoPath}:${tag}`;
+    const missing = tagList.filter((tag) => !tagCache.has(tagKey(tag)));
+    const fetched = new Map();
     const BATCH = 25;
-    const versions = [];
-    for (let i = 0; i < tagList.length; i += BATCH) {
-      const batch = tagList.slice(i, i + BATCH);
-      const results = await Promise.all(
+    for (let i = 0; i < missing.length; i += BATCH) {
+      const batch = missing.slice(i, i + BATCH);
+      await Promise.all(
         batch.map(async (tag) => {
           const extra = await fetchManifestForTag(baseUrl, repoPath, tag, authHeaders);
-          return { name: chart_name, version: tag, ...extra };
+          fetched.set(tag, extra);
+          // Başarısız (digest'siz) sonuçları saklama; sonraki istekte tekrar denensin
+          if (extra.digest) tagCache.set(tagKey(tag), extra);
         }),
       );
-      versions.push(...results);
     }
+    if (fetched.size > 0) saveChartTagCache();
+    const versions = tagList.map((tag) => ({
+      name: chart_name,
+      version: tag,
+      ...(tagCache.get(tagKey(tag)) || fetched.get(tag) || {}),
+    }));
     versions.sort((a, b) => {
       const pa = (a.version || '').replace(/^v/, '').split(/[.-]/).map((n) => parseInt(n, 10) || 0);
       const pb = (b.version || '').replace(/^v/, '').split(/[.-]/).map((n) => parseInt(n, 10) || 0);
@@ -1444,7 +1496,7 @@ app.get('/api/v1/releases', async (req, res) => {
     const repo = getEffectiveAppConfig().HELM_CHART_REPO || '';
     const parsed = parseHelmChartRepo(repo);
     const chartName = parsed ? parsed.chart_name : (chartFilter || 'vnext');
-    const { code, signal, stdout, stderr } = await run('helm', ['list', '-A', '-o', 'json'], { cwd: ROOT });
+    const { code, signal, stdout, stderr } = await run('helm', ['list', '-A', '--max', '0', '-o', 'json'], { cwd: ROOT });
     if (code !== 0 || signal) {
       let detail = (stderr || stdout || '').trim();
       if (!detail && signal) {
