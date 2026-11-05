@@ -71,8 +71,9 @@ Vite dev sunucusu `/api` isteklerini `http://localhost:3000` adresine proxy eder
 | -------------------- | -------------------------------------------- | --------------------------------------------------------------- |
 | `PORT`               | `3000`                                       | Sunucu portu                                                    |
 | `PAT_DATA_DIR`       | `./data`                                     | Veri dizini (config, PAT, domain values)                        |
-| `ADMIN_PAGE_ENABLED` | `false`                                      | Admin panelini aktifleştir (**yalnızca lokal geliştirme için**) |
+| `ADMIN_PAGE_ENABLED` | `false`                                      | Admin panelini ve admin API'lerini (`/api/*`, `/api/v1/*` hariç) aktifleştir (**yalnızca lokal geliştirme için**) |
 | `HELM_CHART_REPO`    | `oci://registry.example.com/charts/vnext` | Helm chart OCI repository URL'i                                 |
+| `REGISTRY_INSECURE_SKIP_TLS_VERIFY` | `false`                      | Registry TLS sertifika doğrulamasını kapat (self-signed registry; tercihen `NODE_EXTRA_CA_CERTS` kullanın) |
 | `NPM_REGISTRY`       | —                                            | NPM registry adresi                                             |
 | `NPM_EMAIL`          | —                                            | NPM kullanıcı e-postası                                         |
 | `NPM_USERNAME`       | —                                            | NPM kullanıcı adı                                               |
@@ -261,8 +262,9 @@ The Vite dev server proxies `/api` requests to `http://localhost:3000`.
 | -------------------- | -------------------------------------------- | ----------------------------------------------- |
 | `PORT`               | `3000`                                       | Server port                                     |
 | `PAT_DATA_DIR`       | `./data`                                     | Data directory (config, PAT, domain values)     |
-| `ADMIN_PAGE_ENABLED` | `false`                                      | Enable admin panel (**local development only**) |
+| `ADMIN_PAGE_ENABLED` | `false`                                      | Enable admin panel and admin APIs (`/api/*` except `/api/v1/*`) (**local development only**) |
 | `HELM_CHART_REPO`    | `oci://registry.example.com/charts/vnext` | Helm chart OCI repository URL                   |
+| `REGISTRY_INSECURE_SKIP_TLS_VERIFY` | `false`                      | Disable registry TLS certificate verification (self-signed registry; prefer `NODE_EXTRA_CA_CERTS`) |
 | `NPM_REGISTRY`       | —                                            | NPM registry URL                                |
 | `NPM_EMAIL`          | —                                            | NPM user email                                  |
 | `NPM_USERNAME`       | —                                            | NPM username                                    |

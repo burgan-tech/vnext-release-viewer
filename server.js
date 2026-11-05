@@ -1,16 +1,25 @@
 const express = require('express');
-const cors = require('cors');
 const compression = require('compression');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
 const zlib = require('zlib');
+const { promisify } = require('util');
 
 const { createRun } = require('./lib/run');
 const { createCache } = require('./lib/cache');
 const { ensureInClusterKubeconfig } = require('./lib/kubeconfig');
+const { listHelmReleases } = require('./lib/helm-releases');
 
-const REGISTRY_HTTPS_AGENT = new https.Agent({ rejectUnauthorized: false });
+const gunzipAsync = promisify(zlib.gunzip);
+
+// TLS doğrulaması varsayılan açık; self-signed registry için REGISTRY_INSECURE_SKIP_TLS_VERIFY=true
+// (tercihen NODE_EXTRA_CA_CERTS ile CA eklenmeli). keepAlive: tag başına yeni TLS el sıkışması olmasın.
+const REGISTRY_HTTPS_AGENT = new https.Agent({
+  rejectUnauthorized: process.env.REGISTRY_INSECURE_SKIP_TLS_VERIFY !== 'true',
+  keepAlive: true,
+  maxSockets: 16,
+});
 
 const ROOT = __dirname;
 const DATA_DIR = process.env.PAT_DATA_DIR || path.join(ROOT, 'data');
@@ -23,13 +32,57 @@ const PORT = process.env.PORT || 3000;
 
 ensureInClusterKubeconfig();
 const { run, runKubectl } = createRun(ROOT);
-const { getCached, setCache } = createCache(60 * 1000);
+const { getCached, setCache, getOrLoad } = createCache(60 * 1000);
 
 const app = express();
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
 app.use(compression({ threshold: 256 }));
-app.use(cors());
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  next();
+});
+
+// CSRF: başka bir siteden gelen state değiştiren istekleri reddet (CORS açık değil; bu ek koruma
+// body'siz POST'lar — unseal/restart/scale — için gerekli, çünkü bunlar preflight tetiklemez)
+app.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  const origin = req.get('origin');
+  if (origin) {
+    try {
+      if (new URL(origin).host === req.get('host')) return next();
+    } catch (_) {}
+    return res.status(403).json({ success: false, error: 'Cross-origin istek reddedildi.' });
+  }
+  if (req.get('sec-fetch-site') === 'cross-site') {
+    return res.status(403).json({ success: false, error: 'Cross-origin istek reddedildi.' });
+  }
+  next();
+});
+
 app.use(express.json());
+
+// Admin API'leri (vault token, credentials, deploy/delete, app-config) yalnızca ADMIN_PAGE_ENABLED=true iken erişilebilir.
+// Viewer'ın kullandığı /api/v1/* her zaman açık.
+app.use('/api', (req, res, next) => {
+  if (ADMIN_PAGE_ENABLED || req.path.startsWith('/v1/')) return next();
+  res.status(404).json({ success: false, error: 'Admin API kapalı (ADMIN_PAGE_ENABLED=true gerekir).' });
+});
+
+// Domain → namespace/release/DB adı/vault path olarak kullanılıyor; DNS label dışı karakter
+// SQL (CREATE DATABASE), helm --set ve kubectl argüman enjeksiyonuna yol açar.
+const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,45}[a-z0-9])?$/;
+function isValidDomain(domain) {
+  return typeof domain === 'string' && DOMAIN_RE.test(domain);
+}
+const CHART_VERSION_RE = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/;
+function isValidChartVersion(v) {
+  return typeof v === 'string' && CHART_VERSION_RE.test(v);
+}
+const INVALID_DOMAIN_MSG = 'Geçersiz domain adı (küçük harf, rakam ve "-"; en fazla 47 karakter).';
+const INVALID_VERSION_MSG = 'Geçersiz chart versiyonu.';
 
 function ensureDomainsValuesDir() {
   if (!fs.existsSync(DOMAINS_VALUES_DIR)) {
@@ -146,6 +199,9 @@ async function deploySingleDomain(domain, chartVersion, { ROOT_TOKEN, REDIS_PASS
 app.post('/api/deploy', async (req, res) => {
   try {
     const { version } = req.body || {};
+    if (version && String(version).trim() && !isValidChartVersion(String(version).trim())) {
+      return res.status(400).json({ success: false, error: INVALID_VERSION_MSG });
+    }
     const helmRepo = getEffectiveAppConfig().HELM_CHART_REPO || 'oci://registry.example.com/charts/vnext';
     await ensureHelmRegistryLogin(helmRepo);
     const args = [
@@ -255,6 +311,13 @@ app.post('/api/deploy-domains', async (req, res) => {
   }
   if (domains.length === 0) {
     return res.status(400).json({ success: false, error: 'En az bir domain adı girin.' });
+  }
+  const badDomains = domains.filter((d) => !isValidDomain(d));
+  if (badDomains.length > 0) {
+    return res.status(400).json({ success: false, error: `${INVALID_DOMAIN_MSG} ${badDomains.join(', ')}` });
+  }
+  if (chartVersion && !isValidChartVersion(chartVersion)) {
+    return res.status(400).json({ success: false, error: INVALID_VERSION_MSG });
   }
 
   const logs = [];
@@ -480,9 +543,9 @@ app.get('/api/domains', async (req, res) => {
     }
   }
   try {
-    const [nsResult, helmResult] = await Promise.all([
+    const [nsResult, releases] = await Promise.all([
       runKubectl(['get', 'namespaces', '-o', 'json']),
-      run('helm', ['list', '-A', '--max', '0', '-o', 'json'], { cwd: ROOT }),
+      listHelmReleases(runKubectl).catch(() => null),
     ]);
     if (nsResult.code !== 0) {
       return res.status(500).json({ success: false, error: 'Namespace listesi alınamadı.' });
@@ -492,21 +555,17 @@ app.get('/api/domains', async (req, res) => {
       .map((ns) => ns.metadata?.name)
       .filter(Boolean)
       .filter((name) => name.startsWith(DOMAIN_NS_PREFIX) && !DOMAIN_NS_EXCLUDE.has(name));
+    const domainNsSet = new Set(domainNamespaces);
 
     const versionByNamespace = {};
     const statusByNamespace = {};
-    if (helmResult.code === 0) {
-      try {
-        const releases = JSON.parse(helmResult.stdout || '[]');
-        (releases || []).forEach((r) => {
-          if (r.namespace && domainNamespaces.includes(r.namespace)) {
-            if (r.chart) versionByNamespace[r.namespace] = chartToVersion(r.chart);
-            const st = r.status;
-            statusByNamespace[r.namespace] = (st && typeof st === 'string') ? st : '—';
-          }
-        });
-      } catch (_) {}
-    }
+    (releases || []).forEach((r) => {
+      if (r.namespace && domainNsSet.has(r.namespace)) {
+        if (r.chart) versionByNamespace[r.namespace] = chartToVersion(r.chart);
+        const st = r.status;
+        statusByNamespace[r.namespace] = (st && typeof st === 'string') ? st : '—';
+      }
+    });
 
     let scaleReadyList;
     if (wantFull) {
@@ -549,9 +608,9 @@ app.get('/api/domains', async (req, res) => {
 
 // --- Domain restart (rollout restart) ---
 app.post('/api/domains/:domain/restart', async (req, res) => {
-  const domain = (req.params.domain || '').trim().replace(/\.\./g, '').replace(/[/\\]/g, '');
-  if (!domain) {
-    return res.status(400).json({ success: false, error: 'Domain gerekli.' });
+  const domain = (req.params.domain || '').trim();
+  if (!isValidDomain(domain)) {
+    return res.status(400).json({ success: false, error: INVALID_DOMAIN_MSG });
   }
   const ns = DOMAIN_NS_PREFIX + domain;
   try {
@@ -594,9 +653,9 @@ app.post('/api/domains/:domain/restart', async (req, res) => {
 
 // --- Domain scale (0 ↔ 1 toggle) ---
 app.post('/api/domains/:domain/scale', async (req, res) => {
-  const domain = (req.params.domain || '').trim().replace(/\.\./g, '').replace(/[/\\]/g, '');
-  if (!domain) {
-    return res.status(400).json({ success: false, error: 'Domain gerekli.' });
+  const domain = (req.params.domain || '').trim();
+  if (!isValidDomain(domain)) {
+    return res.status(400).json({ success: false, error: INVALID_DOMAIN_MSG });
   }
   const ns = DOMAIN_NS_PREFIX + domain;
   try {
@@ -640,8 +699,8 @@ app.post('/api/domains/:domain/scale', async (req, res) => {
 
 // --- Domain values dosyası (path traversal önleme) ---
 function domainToValuesPath(domain) {
-  const safe = String(domain).trim().replace(/\.\./g, '').replace(/[/\\]/g, '');
-  if (!safe) return null;
+  const safe = String(domain).trim();
+  if (!isValidDomain(safe)) return null;
   return path.join(DOMAINS_VALUES_DIR, `${safe}-values.yaml`);
 }
 
@@ -683,6 +742,9 @@ app.post('/api/domain-upgrade', async (req, res) => {
   const domain = req.body?.domain && String(req.body.domain).trim();
   if (!domain) {
     return res.status(400).json({ success: false, error: 'Domain girin.' });
+  }
+  if (!isValidDomain(domain)) {
+    return res.status(400).json({ success: false, error: INVALID_DOMAIN_MSG });
   }
   const valuesPath = domainToValuesPath(domain);
   if (!valuesPath || !fs.existsSync(valuesPath)) {
@@ -746,6 +808,10 @@ app.post('/api/domains/delete', async (req, res) => {
   }
   if (domains.length === 0) {
     return res.status(400).json({ success: false, error: 'En az bir domain girin.' });
+  }
+  const badDomains = domains.filter((d) => !isValidDomain(d));
+  if (badDomains.length > 0) {
+    return res.status(400).json({ success: false, error: `${INVALID_DOMAIN_MSG} ${badDomains.join(', ')}` });
   }
 
   const logs = [];
@@ -947,19 +1013,18 @@ app.get('/api/infra-credentials', async (req, res) => {
 });
 
 // --- Infra ve uygulama URL'leri (NodePort) ---
-async function getServiceNodePort(namespace, serviceName) {
-  const result = await runKubectl([
-    'get', 'svc', serviceName, '-n', namespace, '-o', 'json',
-  ]);
-  if (result.code !== 0) return null;
+// Servis başına ayrı kubectl süreci yerine tek çağrı: "namespace/name" → ilk portun nodePort'u
+async function getNodePortMap() {
+  const result = await runKubectl(['get', 'svc', '-A', '-o', 'json']);
+  const map = new Map();
+  if (result.code !== 0) return map;
   try {
-    const svc = JSON.parse(result.stdout);
-    const ports = svc?.spec?.ports || [];
-    const first = ports[0];
-    return first?.nodePort != null ? first.nodePort : null;
-  } catch (_) {
-    return null;
-  }
+    for (const svc of JSON.parse(result.stdout || '{}').items || []) {
+      const first = svc?.spec?.ports?.[0];
+      if (first?.nodePort != null) map.set(`${svc.metadata?.namespace}/${svc.metadata?.name}`, first.nodePort);
+    }
+  } catch (_) {}
+  return map;
 }
 
 app.get('/api/urls', async (req, res) => {
@@ -980,7 +1045,10 @@ app.get('/api/urls', async (req, res) => {
       { name: 'Dapr Dashboard', svc: 'dapr-dashboard', ns: INFRA_NAMESPACE },
     ];
 
-    const nsResult = await runKubectl(['get', 'namespaces', '-o', 'json']);
+    const [nsResult, nodePorts] = await Promise.all([
+      runKubectl(['get', 'namespaces', '-o', 'json']),
+      getNodePortMap(),
+    ]);
     let domainNamespaces = [];
     if (nsResult.code === 0) {
       try {
@@ -992,21 +1060,18 @@ app.get('/api/urls', async (req, res) => {
       } catch (_) {}
     }
 
-    const infraPortPromises = infraServices.map(({ name, svc, ns }) =>
-      getServiceNodePort(ns, svc).then((port) => ({ name, url: port != null ? `http://localhost:${port}` : null })),
-    );
-    const appPortPromises = domainNamespaces.map((ns) => {
+    const infrastructure = infraServices.map(({ name, svc, ns }) => {
+      const port = nodePorts.get(`${ns}/${svc}`);
+      return { name, url: port != null ? `http://localhost:${port}` : null };
+    });
+    const applications = domainNamespaces.map((ns) => {
       const domain = ns.replace(/^vnext-/, '');
-      return getServiceNodePort(ns, `vnext-${domain}-orchestrator`).then((port) => ({
+      const port = nodePorts.get(`${ns}/vnext-${domain}-orchestrator`);
+      return {
         name: `vnext-${domain}`,
         url: port != null ? `http://localhost:${port}/swagger/index.html` : null,
-      }));
+      };
     });
-
-    const [infrastructure, applications] = await Promise.all([
-      Promise.all(infraPortPromises),
-      Promise.all(appPortPromises),
-    ]);
 
     const payload = { success: true, infrastructure, applications };
     setCache('admin:urls', payload, ADMIN_CACHE_TTL);
@@ -1051,7 +1116,7 @@ function writeAppConfigOverrides(overrides) {
         out[key] = v;
       }
     }
-    fs.writeFileSync(APP_CONFIG_FILE, JSON.stringify(out, null, 2), 'utf8');
+    fs.writeFileSync(APP_CONFIG_FILE, JSON.stringify(out, null, 2), { encoding: 'utf8', mode: 0o600 });
   } catch (_) {}
 }
 
@@ -1104,7 +1169,8 @@ async function ensureHelmRegistryLogin(ociRepoUrl) {
   const user = (cfg.REGISTRY_USER || '').trim();
   const password = (cfg.REGISTRY_PASSWORD || '').trim();
   if (!user || !password) return;
-  const result = await run('helm', ['registry', 'login', parsed.registry, '-u', user, '-p', password], { cwd: ROOT });
+  // Parola argv yerine stdin'den: process listesinde (ps) görünmesin
+  const result = await run('helm', ['registry', 'login', parsed.registry, '-u', user, '--password-stdin'], { cwd: ROOT, input: password });
   if (result.code !== 0) {
     const msg = (result.stderr || result.stdout || '').trim() || 'Registry login failed.';
     throw new Error(`Helm registry login (${parsed.registry}) başarısız: ${msg}. REGISTRY_USER ve REGISTRY_PASSWORD (ghcr.io için PAT) kontrol edin.`);
@@ -1291,7 +1357,7 @@ async function appVersionFromChartLayer(baseUrl, repoPath, manifest, authHeaders
     if (blobRes.status !== 200 || !Buffer.isBuffer(blobRes.body)) return null;
     let buf = blobRes.body;
     if ((layer.mediaType || '').includes('gzip')) {
-      buf = zlib.gunzipSync(buf);
+      buf = await gunzipAsync(buf);
     }
     const str = buf.toString('utf8');
     const m = str.match(/appVersion:\s*["']?([^"'\r\n]+)["']?/);
@@ -1372,109 +1438,128 @@ function saveChartTagCache() {
   } catch (_) {}
 }
 
-app.get('/api/v1/chart/versions', async (req, res) => {
-  const skipCache = req.query.refresh === 'true' || req.query.refresh === '1';
-  if (!skipCache) {
-    const cached = getCached('chart-versions');
-    if (cached) {
-      res.setHeader('Cache-Control', 'public, max-age=60');
-      return res.json(cached);
+// items üzerinde en fazla `limit` eşzamanlı fn çalıştır (batch'te en yavaşı beklemeden)
+async function mapLimit(items, limit, fn) {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const item = items[next++];
+      await fn(item);
+    }
+  });
+  await Promise.all(workers);
+}
+
+const CHART_VERSIONS_TTL = 120000;
+const RELEASES_TTL = 60000;
+
+async function loadChartVersions(parsed, cfg) {
+  const { registry, project, chart_name } = parsed;
+  const baseUrl = `https://${registry}`;
+  const repoPath = `${project}/${chart_name}`;
+  const TAGS_PAGE_SIZE = 100;
+  const tagsUrl = `${baseUrl}/v2/${repoPath}/tags/list?n=${TAGS_PAGE_SIZE}`;
+  let authHeaders = {};
+  if (cfg.REGISTRY_USER && cfg.REGISTRY_PASSWORD) {
+    authHeaders = {
+      Authorization: 'Basic ' + Buffer.from(cfg.REGISTRY_USER + ':' + cfg.REGISTRY_PASSWORD, 'utf8').toString('base64'),
+    };
+  }
+  let response = await httpsGet(tagsUrl, { headers: authHeaders });
+  if (response.status === 401) {
+    const wwwAuth = response.headers['www-authenticate'];
+    const token = await getOciBearerToken(registry, repoPath, wwwAuth, baseUrl, {
+      user: cfg.REGISTRY_USER || '',
+      password: cfg.REGISTRY_PASSWORD || '',
+    });
+    if (token) {
+      authHeaders = { Authorization: `Bearer ${token}` };
+      response = await httpsGet(tagsUrl, { headers: authHeaders });
     }
   }
+  if (response.status !== 200) {
+    throw new Error(`Registry ${response.status}: ${(response.body || '').slice(0, 200)}`);
+  }
+  // Registry tag listesi sayfalı döner (ghcr.io varsayılan 100); Link rel="next" bittiğinde dur
+  const tagSet = new Set();
+  for (let page = 0; page < 50; page++) {
+    const data = response.json();
+    const before = tagSet.size;
+    for (const t of Array.isArray(data.tags) ? data.tags : []) {
+      if (t && typeof t === 'string') tagSet.add(t);
+    }
+    const nextMatch = /<([^>]+)>\s*;\s*rel="?next"?/i.exec(response.headers.link || '');
+    if (!nextMatch || tagSet.size === before) break;
+    // ghcr.io next linkinde n=0 döndürüyor; sayfa boyutunu açıkça ver
+    const nextUrl = new URL(nextMatch[1], baseUrl);
+    // Link başka bir host'a yönlendirmesin (auth header'ı sızdırmamak için)
+    if (nextUrl.host !== new URL(baseUrl).host) break;
+    nextUrl.searchParams.set('n', String(TAGS_PAGE_SIZE));
+    response = await httpsGet(nextUrl.toString(), { headers: authHeaders });
+    if (response.status !== 200) {
+      throw new Error(`Registry ${response.status}: ${(response.body || '').slice(0, 200)}`);
+    }
+  }
+  const tagList = [...tagSet];
+  const tagCache = loadChartTagCache();
+  const tagKey = (tag) => `${registry}/${repoPath}:${tag}`;
+  const missing = tagList.filter((tag) => !tagCache.has(tagKey(tag)));
+  const fetched = new Map();
+  await mapLimit(missing, 16, async (tag) => {
+    const extra = await fetchManifestForTag(baseUrl, repoPath, tag, authHeaders).catch(() => ({}));
+    fetched.set(tag, extra);
+    // Başarısız (digest'siz) sonuçları saklama; sonraki istekte tekrar denensin
+    if (extra.digest) tagCache.set(tagKey(tag), extra);
+  });
+  if (fetched.size > 0) saveChartTagCache();
+  const versions = tagList.map((tag) => ({
+    name: chart_name,
+    version: tag,
+    ...(tagCache.get(tagKey(tag)) || fetched.get(tag) || {}),
+  }));
+  versions.sort((a, b) => {
+    const pa = (a.version || '').replace(/^v/, '').split(/[.-]/).map((n) => parseInt(n, 10) || 0);
+    const pb = (b.version || '').replace(/^v/, '').split(/[.-]/).map((n) => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const va = pa[i] || 0;
+      const vb = pb[i] || 0;
+      if (va !== vb) return vb - va;
+    }
+    return 0;
+  });
+  return {
+    chart_name,
+    registry: `oci://${registry}/${project}/${chart_name}`,
+    versions,
+    total_count: versions.length,
+  };
+}
+
+function getChartVersionsCached(force = false) {
+  const cfg = getEffectiveAppConfig();
+  const parsed = parseHelmChartRepo(cfg.HELM_CHART_REPO || '');
+  if (!parsed) return Promise.resolve(null);
+  return getOrLoad(`chart-versions:${parsed.full_path}`, () => loadChartVersions(parsed, cfg), {
+    ttlMs: CHART_VERSIONS_TTL,
+    force,
+  });
+}
+
+// Viewer (/api/v1/releases) ve admin (/api/domains) aynı listeyi paylaşır
+function getHelmReleasesCached(force = false) {
+  return getOrLoad('helm-releases', () => listHelmReleases(runKubectl), { ttlMs: RELEASES_TTL, force });
+}
+
+app.get('/api/v1/chart/versions', async (req, res) => {
+  const skipCache = req.query.refresh === 'true' || req.query.refresh === '1';
   try {
-    const cfg = getEffectiveAppConfig();
-    const repo = cfg.HELM_CHART_REPO || '';
-    const parsed = parseHelmChartRepo(repo);
-    if (!parsed) {
+    const payload = await getChartVersionsCached(skipCache);
+    if (!payload) {
       return res.status(503).json({
         error: 'HELM_CHART_REPO tanımlı değil veya geçersiz.',
       });
     }
-    const { registry, project, chart_name } = parsed;
-    const baseUrl = `https://${registry}`;
-    const repoPath = `${project}/${chart_name}`;
-    const TAGS_PAGE_SIZE = 100;
-    const tagsUrl = `${baseUrl}/v2/${repoPath}/tags/list?n=${TAGS_PAGE_SIZE}`;
-    let authHeaders = {};
-    if (cfg.REGISTRY_USER && cfg.REGISTRY_PASSWORD) {
-      authHeaders = {
-        Authorization: 'Basic ' + Buffer.from(cfg.REGISTRY_USER + ':' + cfg.REGISTRY_PASSWORD, 'utf8').toString('base64'),
-      };
-    }
-    let response = await httpsGet(tagsUrl, { headers: authHeaders });
-    if (response.status === 401) {
-      const wwwAuth = response.headers['www-authenticate'];
-      const token = await getOciBearerToken(registry, repoPath, wwwAuth, baseUrl, {
-        user: cfg.REGISTRY_USER || '',
-        password: cfg.REGISTRY_PASSWORD || '',
-      });
-      if (token) {
-        authHeaders = { Authorization: `Bearer ${token}` };
-        response = await httpsGet(tagsUrl, { headers: authHeaders });
-      }
-    }
-    if (response.status !== 200) {
-      throw new Error(`Registry ${response.status}: ${(response.body || '').slice(0, 200)}`);
-    }
-    // Registry tag listesi sayfalı döner (ghcr.io varsayılan 100); Link rel="next" bittiğinde dur
-    const tagSet = new Set();
-    for (let page = 0; page < 50; page++) {
-      const data = response.json();
-      const before = tagSet.size;
-      for (const t of Array.isArray(data.tags) ? data.tags : []) {
-        if (t && typeof t === 'string') tagSet.add(t);
-      }
-      const nextMatch = /<([^>]+)>\s*;\s*rel="?next"?/i.exec(response.headers.link || '');
-      if (!nextMatch || tagSet.size === before) break;
-      // ghcr.io next linkinde n=0 döndürüyor; sayfa boyutunu açıkça ver
-      const nextUrl = new URL(nextMatch[1], baseUrl);
-      nextUrl.searchParams.set('n', String(TAGS_PAGE_SIZE));
-      response = await httpsGet(nextUrl.toString(), { headers: authHeaders });
-      if (response.status !== 200) {
-        throw new Error(`Registry ${response.status}: ${(response.body || '').slice(0, 200)}`);
-      }
-    }
-    const tagList = [...tagSet];
-    const tagCache = loadChartTagCache();
-    const tagKey = (tag) => `${registry}/${repoPath}:${tag}`;
-    const missing = tagList.filter((tag) => !tagCache.has(tagKey(tag)));
-    const fetched = new Map();
-    const BATCH = 25;
-    for (let i = 0; i < missing.length; i += BATCH) {
-      const batch = missing.slice(i, i + BATCH);
-      await Promise.all(
-        batch.map(async (tag) => {
-          const extra = await fetchManifestForTag(baseUrl, repoPath, tag, authHeaders);
-          fetched.set(tag, extra);
-          // Başarısız (digest'siz) sonuçları saklama; sonraki istekte tekrar denensin
-          if (extra.digest) tagCache.set(tagKey(tag), extra);
-        }),
-      );
-    }
-    if (fetched.size > 0) saveChartTagCache();
-    const versions = tagList.map((tag) => ({
-      name: chart_name,
-      version: tag,
-      ...(tagCache.get(tagKey(tag)) || fetched.get(tag) || {}),
-    }));
-    versions.sort((a, b) => {
-      const pa = (a.version || '').replace(/^v/, '').split(/[.-]/).map((n) => parseInt(n, 10) || 0);
-      const pb = (b.version || '').replace(/^v/, '').split(/[.-]/).map((n) => parseInt(n, 10) || 0);
-      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-        const va = pa[i] || 0;
-        const vb = pb[i] || 0;
-        if (va !== vb) return vb - va;
-      }
-      return 0;
-    });
-    const payload = {
-      chart_name,
-      registry: `oci://${registry}/${project}/${chart_name}`,
-      versions,
-      total_count: versions.length,
-    };
-    setCache('chart-versions', payload, 120000);
-    res.setHeader('Cache-Control', 'public, max-age=120');
+    res.setHeader('Cache-Control', 'public, max-age=60');
     res.json(payload);
   } catch (err) {
     res.status(500).json({ error: err.message || 'Chart versions alınamadı.' });
@@ -1484,40 +1569,11 @@ app.get('/api/v1/chart/versions', async (req, res) => {
 app.get('/api/v1/releases', async (req, res) => {
   const skipCache = req.query.refresh === 'true' || req.query.refresh === '1';
   const chartFilter = (req.query.chart != null ? String(req.query.chart) : '').trim();
-  const cacheKey = `releases:${chartFilter}`;
-  if (!skipCache) {
-    const cached = getCached(cacheKey);
-    if (cached) {
-      res.setHeader('Cache-Control', 'public, max-age=60');
-      return res.json(cached);
-    }
-  }
   try {
     const repo = getEffectiveAppConfig().HELM_CHART_REPO || '';
     const parsed = parseHelmChartRepo(repo);
     const chartName = parsed ? parsed.chart_name : (chartFilter || 'vnext');
-    const { code, signal, stdout, stderr } = await run('helm', ['list', '-A', '--max', '0', '-o', 'json'], { cwd: ROOT });
-    if (code !== 0 || signal) {
-      let detail = (stderr || stdout || '').trim();
-      if (!detail && signal) {
-        detail = signal === 'SIGKILL'
-          ? 'Process killed (SIGKILL). OOM veya kaynak limiti olabilir – pod memory/CPU artırın.'
-          : `Process killed (signal: ${signal}).`;
-      }
-      if (!detail) detail = code != null ? `exit code ${code}` : 'Process failed to complete.';
-      return res.status(500).json({
-        error: 'Helm list çalıştırılamadı.',
-        detail,
-        releases: [],
-        total_count: 0,
-      });
-    }
-    let list = [];
-    try {
-      list = JSON.parse(stdout || '[]');
-    } catch {
-      return res.json({ chart_filter: chartName, releases: [], total_count: 0 });
-    }
+    const list = await getHelmReleasesCached(skipCache);
     const filter = (chartFilter || chartName || '').toLowerCase();
     const releases = list
       .filter((r) => !filter || (r.chart && r.chart.toLowerCase().includes(filter)))
@@ -1526,8 +1582,6 @@ app.get('/api/v1/releases', async (req, res) => {
         const lastDash = ch.lastIndexOf('-');
         const chart_name = lastDash > 0 ? ch.slice(0, lastDash) : ch;
         const chart_version = lastDash >= 0 ? ch.slice(lastDash + 1) : '';
-        const lastDeployed = r.info?.last_deployed ?? r.updated ?? r.info?.updated ?? undefined;
-        const firstDeployed = r.info?.first_deployed ?? undefined;
         const revision = typeof r.revision === 'number' ? r.revision : parseInt(String(r.revision || '0'), 10) || 0;
         return {
           name: r.name || '',
@@ -1537,20 +1591,18 @@ app.get('/api/v1/releases', async (req, res) => {
           app_version: r.app_version || undefined,
           status: r.status || 'unknown',
           revision,
-          first_deployed: firstDeployed,
-          last_deployed: lastDeployed,
+          first_deployed: r.info?.first_deployed,
+          last_deployed: r.info?.last_deployed,
         };
       });
-    const payload = { chart_filter: chartName, releases, total_count: releases.length };
-    setCache(cacheKey, payload, 60000);
-    res.setHeader('Cache-Control', 'public, max-age=60');
-    res.json(payload);
+    res.setHeader('Cache-Control', 'public, max-age=30');
+    res.json({ chart_filter: chartName, releases, total_count: releases.length });
   } catch (err) {
     const detail = err.code === 'ENOENT'
-      ? 'helm veya kubectl bulunamadı (PATH kontrol edin).'
-      : (err.stderr || err.stdout || err.message);
+      ? 'kubectl bulunamadı (PATH kontrol edin).'
+      : err.message;
     res.status(500).json({
-      error: err.message || 'Releases alınamadı.',
+      error: 'Releases alınamadı.',
       detail,
       releases: [],
       total_count: 0,
@@ -1594,6 +1646,9 @@ app.post('/api/push-package', async (req, res) => {
 
   if (!domain) {
     return res.status(400).json({ success: false, error: 'Domain girin.' });
+  }
+  if (!isValidDomain(domain)) {
+    return res.status(400).json({ success: false, error: INVALID_DOMAIN_MSG });
   }
   if (!packageName) {
     return res.status(400).json({ success: false, error: 'Paket adı girin.' });
@@ -1684,23 +1739,24 @@ if (ADMIN_PAGE_ENABLED) {
 }
 
 const VIEWER_DIST = path.join(__dirname, 'viewer', 'dist');
-if (fs.existsSync(VIEWER_DIST)) {
-  app.use(express.static(VIEWER_DIST, { maxAge: STATIC_CACHE, etag: true }));
-  app.get('/', (_req, res, next) => {
-    if (fs.existsSync(path.join(VIEWER_DIST, 'index.html'))) {
-      res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
-      res.sendFile(path.join(VIEWER_DIST, 'index.html'));
-    } else next();
-  });
+const VIEWER_INDEX = path.join(VIEWER_DIST, 'index.html');
+if (fs.existsSync(VIEWER_INDEX)) {
+  // Vite asset adları içerik hash'i taşır → uzun süreli immutable cache; olmayan asset 404 (index.html değil)
+  app.use('/assets', express.static(path.join(VIEWER_DIST, 'assets'), { maxAge: '1y', immutable: true }));
+  app.use('/assets', (_req, res) => res.sendStatus(404));
+  app.use(express.static(VIEWER_DIST, { maxAge: STATIC_CACHE, etag: true, index: false }));
+  // SPA: index.html her zaman revalidate edilsin ki yeni deploy'daki asset hash'leri hemen görünsün
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api')) return next();
-    const f = path.join(VIEWER_DIST, req.path);
-    if (fs.existsSync(f) && fs.statSync(f).isFile()) return next();
-    if (fs.existsSync(path.join(VIEWER_DIST, 'index.html'))) res.sendFile(path.join(VIEWER_DIST, 'index.html'));
-    else next();
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(VIEWER_INDEX);
   });
 } else {
   app.get('/', (_req, res) => res.send('Helm Release Viewer bulunamadı. viewer dizininde npm run build çalıştırın.'));
 }
 
-app.listen(PORT, '0.0.0.0');
+app.listen(PORT, '0.0.0.0', () => {
+  // İlk kullanıcı registry taraması / release listesini beklemesin: cache'i açılışta ısıt
+  getChartVersionsCached().catch(() => {});
+  getHelmReleasesCached().catch(() => {});
+});
